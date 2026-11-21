@@ -1,0 +1,168 @@
+workflows:
+  ios-masareef-ipa:
+    name: Masareef iOS App + Widget IPA
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      node: 20
+      xcode: latest
+    scripts:
+      - name: Stage custom iOS files & initialize Capacitor iOS
+        script: |
+          set -e
+          npm install --no-audit --no-fund
+          mkdir -p /tmp/masareef_custom_ios
+          cp -R ios/* /tmp/masareef_custom_ios/
+          if [ ! -d "ios/App" ]; then
+            rm -rf ios
+            npx cap add ios
+          fi
+          npx cap sync ios
+      - name: Apply icon, WKWebView bridge, URL scheme & WidgetKit extension target
+        script: |
+          set -e
+          APP_DIR="ios/App"
+          APP_ICONSET="$APP_DIR/App/Assets.xcassets/AppIcon.appiconset"
+          if [ -d "$APP_ICONSET" ] && [ -f "/tmp/masareef_custom_ios/AppIcon-1024.png" ]; then
+            cp "/tmp/masareef_custom_ios/AppIcon-1024.png" "$APP_ICONSET/Icon-App-1024x1024@1x.png"
+            python3 -c 'import json, sys; p = sys.argv[1] + "/Contents.json"; open(p, "w").write(json.dumps({"images":[{"filename":"Icon-App-1024x1024@1x.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}, indent=2))' "$APP_ICONSET"
+          fi
+
+          mkdir -p "$APP_DIR/MasareefWidget" "$APP_DIR/App/AppBridge"
+          cp -R /tmp/masareef_custom_ios/MasareefWidget/* "$APP_DIR/MasareefWidget/"
+          cp -R /tmp/masareef_custom_ios/AppBridge/* "$APP_DIR/App/AppBridge/"
+
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$APP_DIR/App/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$APP_DIR/App/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string com.alhawari.masareef" "$APP_DIR/App/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$APP_DIR/App/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string masareef" "$APP_DIR/App/Info.plist" 2>/dev/null || true
+
+          cat > "$APP_DIR/App/AppDelegate.swift" << 'SWIFT_EOF'
+          import UIKit
+          import Capacitor
+          import WebKit
+
+          @UIApplicationMain
+          class AppDelegate: UIResponder, UIApplicationDelegate {
+              var window: UIWindow?
+              private var bridgeAttached = false
+
+              func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                      self.attachWidgetBridgeIfReady()
+                  }
+                  return true
+              }
+
+              func applicationDidBecomeActive(_ application: UIApplication) {
+                  attachWidgetBridgeIfReady()
+              }
+
+              private func attachWidgetBridgeIfReady() {
+                  guard let vc = window?.rootViewController as? CAPBridgeViewController,
+                        let webView = vc.bridge?.webView else { return }
+                  if !bridgeAttached {
+                      MasareefWidgetSyncHelper.shared.attach(to: webView)
+                      bridgeAttached = true
+                  }
+              }
+
+              func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
+                  let escaped = url.absoluteString.replacingOccurrences(of: "'", with: "\\'")
+                  if let vc = window?.rootViewController as? CAPBridgeViewController,
+                     let webView = vc.bridge?.webView {
+                      webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('appUrlOpen', { detail: { url: '\(escaped)' } }));", completionHandler: nil)
+                  }
+                  return ApplicationDelegateProxy.shared.application(app, open: url, options: options)
+              }
+          }
+          SWIFT_EOF
+
+          ruby -e '
+            require "xcodeproj"
+            proj_path = "ios/App/App.xcodeproj"
+            project = Xcodeproj::Project.open(proj_path)
+            app_target = project.targets.find { |t| t.name == "App" }
+            raise "App target not found" unless app_target
+
+            bridge_group = project.main_group.find_subpath("App/AppBridge", true)
+            if File.exist?("ios/App/App/AppBridge/MasareefWidgetSync.swift")
+              fref = bridge_group.new_reference("AppBridge/MasareefWidgetSync.swift")
+              app_target.add_file_references([fref]) unless app_target.source_build_phase.files_references.include?(fref)
+            end
+
+            app_target.build_configurations.each do |cfg|
+              cfg.build_settings["PRODUCT_BUNDLE_IDENTIFIER"] = "com.alhawari.masareef"
+            end
+
+            unless project.targets.any? { |t| t.name == "MasareefWidget" }
+              ext_target = project.new_target(:app_extension, "MasareefWidget", :ios, "16.0")
+              w_group = project.main_group.find_subpath("MasareefWidget", true)
+              swift_ref = w_group.new_reference("MasareefWidget.swift")
+              ext_target.add_file_references([swift_ref])
+              ext_target.build_configurations.each do |cfg|
+                cfg.build_settings["PRODUCT_BUNDLE_IDENTIFIER"] = "com.alhawari.masareef.widget"
+                cfg.build_settings["INFOPLIST_FILE"] = "MasareefWidget/Info.plist"
+                cfg.build_settings["CODE_SIGN_ENTITLEMENTS"] = "MasareefWidget/MasareefWidget.entitlements"
+                cfg.build_settings["SWIFT_VERSION"] = "5.0"
+                cfg.build_settings["SKIP_INSTALL"] = "YES"
+                cfg.build_settings["TARGETED_DEVICE_FAMILY"] = "1,2"
+              end
+              embed_phase = app_target.copy_files_build_phases.find { |p| p.dst_subfolder_spec == :plug_ins } ||
+                            app_target.new_copy_files_build_phase("Embed App Extensions")
+              embed_phase.dst_subfolder_spec = :plug_ins
+              ef = embed_phase.add_file_reference(ext_target.product_reference)
+              ef.settings = { "ATTRIBUTES" => ["RemoveHeadersOnCopy"] }
+              app_target.add_dependency(ext_target)
+            end
+            project.save
+          '
+      - name: Install CocoaPods
+        script: |
+          set -e
+          cd ios/App && pod install --repo-update
+      - name: Archive unsigned iOS app and package IPA
+        script: |
+          set -e
+          APP_DIR="ios/App"
+          WORKSPACE="$APP_DIR/App.xcworkspace"
+          PROJECT="$APP_DIR/App.xcodeproj"
+          SCHEME="App"
+          ARCHIVE_PATH="$PWD/build/Masareef.xcarchive"
+          IPA_WORK="$PWD/build/ipa_payload"
+          mkdir -p "$IPA_WORK/Payload"
+
+          if [ -d "$WORKSPACE" ]; then
+            xcodebuild archive \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -archivePath "$ARCHIVE_PATH" \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES
+          else
+            xcodebuild archive \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -archivePath "$ARCHIVE_PATH" \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES
+          fi
+
+          APP_BUNDLE=$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
+          test -n "$APP_BUNDLE"
+          cp -R "$APP_BUNDLE" "$IPA_WORK/Payload/"
+          (cd "$IPA_WORK" && zip -r -y "$PWD/../Masareef-iOS.ipa" Payload)
+          ls -lh "$PWD/build/Masareef-iOS.ipa"
+    artifacts:
+      - build/Masareef-iOS.ipa
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
